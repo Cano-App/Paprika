@@ -263,7 +263,8 @@ dialog::backdrop{background:rgba(15,10,6,.45);backdrop-filter:blur(3px)}
     <div class="card">
       <div class="field"><label for="f-source">Source <small>cookbook, person or website</small></label><input class="in" id="f-source" placeholder="e.g. Grandma’s card" autocomplete="off"></div>
       <div class="field"><label for="f-desc">Description</label><textarea class="in" id="f-desc" rows="2" style="min-height:70px"></textarea></div>
-      <div class="field"><label for="f-notes">Notes</label><textarea class="in" id="f-notes" rows="2" style="min-height:70px"></textarea></div>
+      <div class="field"><label for="f-notes">Notes</label><textarea class="in" id="f-notes" rows="3" style="min-height:80px"></textarea></div>
+      <div class="field"><label for="f-nut">Nutrition</label><textarea class="in" id="f-nut" rows="2" style="min-height:70px" placeholder="e.g. Per serving: 174 calories; 5g fat"></textarea></div>
     </div>
   </section>
 
@@ -333,7 +334,7 @@ function delRecipe(id){ return tx('recipes','readwrite',function(s){ s.delete(id
 /* ---------- the recipe being made ---------- */
 var CATS=['Breakfast','Lunch','Dinner','Dessert','Baking','Soup','Salad','Sides','Snacks','Drinks','Vegetarian','Quick'];
 function blankDraft(){ return {id:uuid(),step:1,seen:{},photos:[],name:'',ingredients:'',directions:'',servings:'',prep:'',cook:'',total:'',
-  categories:[],rating:0,difficulty:'',source:'',description:'',notes:'',read:false,created:Date.now()}; }
+  categories:[],rating:0,difficulty:'',source:'',description:'',notes:'',nutrition:'',read:false,created:Date.now()}; }
 var D=blankDraft(), urls={};
 function photoURL(p){ if(!urls[p.id]) urls[p.id]=URL.createObjectURL(p.blob); return urls[p.id]; }
 var saveT=null;
@@ -456,6 +457,7 @@ function setStatus(kind,msg){
 function readPhotos(force){
   var ps=D.photos.filter(function(p){ return p.read; });
   if(!ps.length||reading) return;
+  if(SAMPLER&&IMG_MAX){ claudeRead(ps,force); return; }
   reading=true; renderSteps(); setStatus('reading','Getting the reader ready…');
   var all=[], worker=null, k=0;
   loadTesseract().then(function(T){
@@ -487,6 +489,47 @@ function linesOf(data){
     var t=(l.text||'').replace(/\s+/g,' ').trim(); if(t) out.push({text:t,h:(l.bbox.y1-l.bbox.y0),conf:l.confidence}); }); out.push({text:'',h:0}); }); });
   if(!out.length) String(data.text||'').split('\n').forEach(function(t){ out.push({text:t.trim(),h:10}); });
   return out;
+}
+/* Inside Claude, Claude reads the photos the way a person would: both columns,
+   handwritten notes, crossed-out lines, and the parts of the card that belong in
+   nutrition or notes. Paprika shows **bold** step titles. */
+var SAMPLER=null, IMG_MAX=0, readCtl=null;
+var READ_PROMPT=[
+ 'These photos show a recipe (a printed page, card, cookbook or screen, possibly with handwriting). Some photos may just show the finished dish; ignore those for the text.',
+ 'Turn it into a recipe for the Paprika recipe app. Read everything carefully:',
+ '- Read multi-column layouts column by column, top to bottom, never across columns.',
+ '- Handwritten notes matter: put each one where it belongs, e.g. on its ingredient in parentheses "(handwritten note: use the whole can)" or in a step, and list them all in notes starting "Handwritten:". Quote short ones like "great".',
+ '- Crossed-out text has been removed by the cook: leave it out of the directions and mention it in notes ("... step crossed out").',
+ '- Keep every quantity and ingredient exactly as written, one per line, fixing only obvious misreads. Section headings within ingredients (e.g. "For the sauce:") stay as their own line.',
+ '- Directions: one clear step per item, each with a short bold title, e.g. {"title":"Preheat","text":"Preheat oven to 500 degrees."}. Keep the original wording, warnings and temperatures; split long paragraphs into logical steps.',
+ '- servings, prep_time, cook_time, total_time from the page (cook_time from the main cooking time if only that is given), e.g. "6", "50 minutes".',
+ '- description: one short sentence describing the dish.',
+ '- nutritional_info: the nutrition facts as written ("Per serving: ...").',
+ '- notes: handwritten notes, then serving suggestions, dietary/variation notes, exchanges/points and similar extras, each on its own line.',
+ '- source: the cookbook, publication or website (e.g. "Saving Dinner Menu-Mailer, Volume 11, Week 45"), else "".',
+ '- categories: 1-2 from: '+CATS.join(', ')+'. Use "Soup" for soups.',
+ 'Reply with only JSON: {"name":"","description":"","servings":"","prep_time":"","cook_time":"","total_time":"","ingredients":["..."],"directions":[{"title":"","text":""}],"notes":"","nutritional_info":"","source":"","categories":[]}'
+].join('\n');
+function claudeRead(ps,force){
+  reading=true; renderSteps();
+  readCtl=new AbortController();
+  var t0=Date.now(), tick=setInterval(function(){ var s=Math.round((Date.now()-t0)/1000); setStatus('reading','Claude is reading your recipe… '+s+'s (usually under a minute)'); },1000);
+  setStatus('reading','Claude is reading your recipe…');
+  SAMPLER.json(READ_PROMPT,{images:ps.slice(0,IMG_MAX).map(function(p){ return p.blob; }),modelTier:'complex',signal:readCtl.signal}).then(function(o){
+    o=o||{};
+    var dir=(o.directions||[]).map(function(d){ if(typeof d==='string') return d; var t=String(d.title||'').trim().replace(/[.:]$/,''); return (t?'**'+t+'.** ':'')+String(d.text||'').trim(); }).filter(Boolean);
+    fill({name:o.name||'',ingredients:(o.ingredients||[]).map(String),directions:dir,servings:String(o.servings||''),prep:o.prep_time||'',cook:o.cook_time||'',total:o.total_time||'',notes:[o.notes||'']},true);
+    ['description','source'].forEach(function(k){ if(o[k]&&(force||!String(D[k]||'').trim())) D[k]=String(o[k]); });
+    if(o.nutritional_info&&(force||!D.nutrition)) D.nutrition=String(o.nutritional_info);
+    (o.categories||[]).forEach(function(c){ c=String(c).trim(); if(c&&D.categories.indexOf(c)<0) D.categories.push(c); });
+    D.read=true; save(); syncFields();
+    setStatus('ok','✓ Claude read your recipe. Check it below; details are filled in on step 3.');
+  }).catch(function(e){
+    var c=e&&e.code;
+    setStatus('err',{cancelled:'Stopped. Tap “Read photos again” to try again.',not_granted:'Claude wasn’t allowed to read the photos. Reload and tap Allow, or type the recipe below.',
+      rate_limited:'Claude is busy. Wait a minute, then tap “Read photos again”.',session_expired:'Your Claude sign-in expired. Sign in again, then tap “Read photos again”.',
+      image_rejected:'Claude couldn’t use one of the photos. Try a different photo.',refused:'Claude couldn’t read that. Try another photo or type it below.'}[c]||'Claude couldn’t read the photos this time. Tap “Read photos again” or type it below.');
+  }).then(function(){ clearInterval(tick); reading=false; readCtl=null; renderAll(); });
 }
 /* Turn read lines into name / ingredients / directions / details */
 var UNIT=/\b(cups?|c\.|tbsps?|tablespoons?|tsps?|teaspoons?|oz|ounces?|lbs?|pounds?|grams?|g|kg|ml|l|liters?|litres?|pinch|dash|cloves?|cans?|pkgs?|packages?|sticks?|slices?|large|medium|small|whole|handful|bunch|sprigs?|quarts?|pints?)\b/i;
@@ -543,6 +586,7 @@ function fill(r,force){
   syncFields();
 }
 $('btn-reread').addEventListener('click',function(){
+  if(readCtl){ readCtl.abort(); return; }
   if(!D.photos.some(function(p){ return p.read; })){ toast('Mark a photo with 📖 to read it.'); return; }
   ask('Read the photos again?','This replaces the name, ingredients and directions with what the photos say.','Read again',function(){ D.read=false; readPhotos(true); });
 });
@@ -553,7 +597,7 @@ $('btn-paste').addEventListener('click',function(){
 });
 
 /* ---------- fields ---------- */
-var FIELDS={'f-name':'name','f-ing':'ingredients','f-dir':'directions','f-serv':'servings','f-prep':'prep','f-cook':'cook','f-total':'total','f-source':'source','f-desc':'description','f-notes':'notes'};
+var FIELDS={'f-name':'name','f-ing':'ingredients','f-dir':'directions','f-serv':'servings','f-prep':'prep','f-cook':'cook','f-total':'total','f-source':'source','f-desc':'description','f-notes':'notes','f-nut':'nutrition'};
 Object.keys(FIELDS).forEach(function(id){ $(id).addEventListener('input',function(){ D[FIELDS[id]]=this.value; save(); renderSteps(); renderDock(); counts(); }); });
 function syncFields(){ Object.keys(FIELDS).forEach(function(id){ if(document.activeElement!==$(id)) $(id).value=D[FIELDS[id]]||''; }); counts(); }
 function counts(){ var i=lines(D.ingredients).length, d=lines(D.directions).length; $('c-ing').textContent=i?i+' item'+(i===1?'':'s'):''; $('c-dir').textContent=d?d+' step'+(d===1?'':'s'):''; }
@@ -591,8 +635,8 @@ function paprikaJSON(r){
     var mainData=datas[0], extra=datas.slice(1);
     return Promise.all([mainData?sha(mainData):'',sha(r.id+r.name+r.ingredients+r.directions)].concat(extra.map(sha))).then(function(h){
       var o={
-        uid:r.id, name:r.name.trim(), directions:r.directions.trim(), ingredients:r.ingredients.trim(),
-        description:(r.description||'').trim(), notes:(r.notes||'').trim(), nutritional_info:'',
+        uid:r.id, name:r.name.trim(), directions:lines(r.directions).join('\n\n'), ingredients:r.ingredients.trim(),
+        description:(r.description||'').trim(), notes:(r.notes||'').trim(), nutritional_info:(r.nutrition||'').trim(),
         servings:(r.servings||'').trim(), prep_time:(r.prep||'').trim(), cook_time:(r.cook||'').trim(), total_time:(r.total||'').trim(),
         difficulty:r.difficulty||'', rating:r.rating||0, categories:r.categories.slice(),
         source:(r.source||'').trim(), source_url:'', image_url:null,
@@ -612,7 +656,15 @@ function zipFile(entries,name){
   var z=fflate.zipSync(files);
   return new File([z],safeName(name)+'.paprikarecipes',{type:'application/octet-stream'});
 }
+var SAVER=null;
 function share(file){
+  if(SAVER) return SAVER.save({filename:file.name,data:file}).then(function(){ return true; },function(e){
+    if(e&&e.code==='declined') return false;
+    toast('Couldn’t save it here ('+((e&&e.code)||'error')+'). Trying another way…'); return plainShare(file);
+  });
+  return plainShare(file);
+}
+function plainShare(file){
   if(navigator.canShare&&navigator.canShare({files:[file]})){
     return navigator.share({files:[file],title:file.name}).then(function(){ return true; },function(e){ if(e&&e.name==='AbortError') return false; download(file); return true; });
   }
@@ -682,7 +734,7 @@ $('btn-export-sel').addEventListener('click',function(){
   share(zipFile(list.map(function(r){ return {name:r.name,gz:r.gz}; }),list.length===1?list[0].name:list.length+' recipes'));
 });
 
-function renderAll(){ renderSteps(); renderDock(); renderPhotos(); renderCats(); renderStars(); counts(); }
+function renderAll(){ renderSteps(); renderDock(); renderPhotos(); renderCats(); renderStars(); counts(); $('btn-reread').textContent=readCtl?'Stop reading':'Read photos again'; }
 
 /* ---------- start: pick up where you left off ---------- */
 kvGet('draft').then(function(d){
@@ -692,6 +744,10 @@ kvGet('draft').then(function(d){
   if(D.step===4) renderFinish();
   renderAll(); renderSaved();
 });
+if(window.claude&&window.claude.use){
+  window.claude.use('sample').then(function(s){ SAMPLER=s||null; if(!s) return; return s.limits().then(function(l){ IMG_MAX=(l&&l.images&&l.images.maxCount)||0; renderAll(); }); }).catch(function(){});
+  window.claude.use('downloads').then(function(d){ SAVER=d||null; }).catch(function(){});
+}
 window.__pm={get draft(){ return D; },parseRecipe:parseRecipe,paprikaJSON:paprikaJSON,gzRecipe:gzRecipe,zipFile:zipFile,go:go};
 })();
 </script>
